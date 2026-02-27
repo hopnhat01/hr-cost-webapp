@@ -1,0 +1,5 @@
+Metadata-Version: 2.4
+Name: hr-cost
+Version: 0.0.1
+Summary: HR monthly cost calculator (Mon-Sat)
+Requires-Python: >=3.10
