@@ -1,19 +1,34 @@
 import io
-from datetime import date, datetime
+import calendar
+from datetime import date, datetime, timedelta
 
 import pandas as pd
 import streamlit as st
+from dateutil.relativedelta import relativedelta
 from openpyxl import Workbook
 from openpyxl.utils.dataframe import dataframe_to_rows
 
-from hr_cost.engine import CalculationEngine
-from hr_cost.models import Inputs, Holiday, EmployerInsurance
+def check_password():
+    if "password_correct" not in st.session_state:
+        st.text_input("Nhap mat khau de xam nhap he thong", type="password", on_change=password_entered, key="password")
+        return False
+    elif not st.session_state["password_correct"]:
+        st.text_input("Sai mat khau, yeu cau nhap lai", type="password", on_change=password_entered, key="password")
+        return False
+    else:
+        return True
 
+def password_entered():
+    if st.session_state["password"] == "123456":
+        st.session_state["password_correct"] = True
+        del st.session_state["password"]
+    else:
+        st.session_state["password_correct"] = False
 
-# ----------------------------
-# Helpers
-# ----------------------------
-def to_date(x) -> date | None:
+if not check_password():
+    st.stop()
+
+def to_date(x) -> date:
     if x is None or (isinstance(x, float) and pd.isna(x)):
         return None
     if isinstance(x, date) and not isinstance(x, datetime):
@@ -22,220 +37,269 @@ def to_date(x) -> date | None:
         return x.date()
     return pd.to_datetime(x, dayfirst=True).date()
 
+def is_workday_mon_sat(d: date) -> bool:
+    return d.weekday() <= 5
 
-def read_holidays_upload(upload) -> pd.DataFrame:
-    """
-    Accept CSV/XLSX.
-    Expect a date-like column.
-    Prefer column name: date / Ngày / ngay / holiday_date.
-    """
+def daterange(d1: date, d2: date):
+    cur = d1
+    while cur <= d2:
+        yield cur
+        cur += timedelta(days=1)
+
+def count_workdays_mon_sat(start: date, end: date, holidays_set: set[date]) -> int:
+    cnt = 0
+    for d in daterange(start, end):
+        if is_workday_mon_sat(d) and (d not in holidays_set):
+            cnt += 1
+    return cnt
+
+def count_holidays_monsat(start: date, end: date, holidays_set: set[date]) -> int:
+    cnt = 0
+    for d in daterange(start, end):
+        if d in holidays_set and is_workday_mon_sat(d):
+            cnt += 1
+    return cnt
+
+def month_start_end(year: int, month: int) -> tuple[date, date]:
+    ms = date(year, month, 1)
+    me = date(year, month, calendar.monthrange(year, month)[1])
+    return ms, me
+
+def clamp(x: float, lo: float, hi: float) -> float:
+    return max(lo, min(hi, x))
+
+def parse_holidays_upload(upload) -> pd.DataFrame:
     if upload is None:
         return pd.DataFrame(columns=["date", "name"])
 
-    fname = upload.name.lower()
-    if fname.endswith(".csv"):
+    name = upload.name.lower()
+    if name.endswith(".csv"):
         df = pd.read_csv(upload)
-    elif fname.endswith(".xlsx") or fname.endswith(".xls"):
+    elif name.endswith(".xlsx") or name.endswith(".xls"):
         df = pd.read_excel(upload)
     else:
-        raise ValueError("Chỉ hỗ trợ CSV hoặc XLSX.")
+        raise ValueError("Chi ho tro CSV hoac XLSX.")
 
-    # pick date column
-    candidates = [c for c in df.columns if str(c).strip().lower() in ["date", "ngày", "ngay", "holiday_date", "ngày nghỉ"]]
-    date_col = candidates[0] if candidates else df.columns[0]
+    candidates = [c for c in df.columns if str(c).strip().lower() in ["date", "ngày", "ngay", "holiday_date", "ngày nghỉ", "ngày nghỉ (dd/mm/yyyy)"]]
+    if candidates:
+        date_col = candidates[0]
+    else:
+        date_col = df.columns[0]
 
     df = df.copy()
     df["date"] = df[date_col].apply(to_date)
-
-    # name column
-    if "name" not in df.columns:
-        name_candidates = [c for c in df.columns if str(c).strip().lower() in ["name", "tên", "ten", "holiday_name", "tên ngày lễ"]]
-        df["name"] = df[name_candidates[0]].astype(str) if name_candidates else ""
-
+    
+    name_candidates = [c for c in df.columns if str(c).strip().lower() in ["name", "tên", "ten", "holiday_name", "tên ngày lễ"]]
+    if name_candidates:
+        df["name"] = df[name_candidates[0]].astype(str)
+    else:
+        df["name"] = ""
+        
     df = df.dropna(subset=["date"]).sort_values("date")
-    return df[["date", "name"]].reset_index(drop=True)
-
-
-def df_to_holidays(df: pd.DataFrame) -> list[Holiday]:
-    holidays = []
-    for _, r in df.iterrows():
-        d = to_date(r.get("date"))
-        if d:
-            holidays.append(Holiday(date=d, name=str(r.get("name", "") or "")))
-    return holidays
-
-
-def result_rows_to_df(rows: list[dict]) -> pd.DataFrame:
-    """
-    Convert engine rows -> a user-friendly dataframe similar to MONTHLY_COST.
-    """
-    df = pd.DataFrame(rows)
-
-    # Reorder columns (friendly)
-    col_order = [
-        "year", "month",
-        "month_start", "month_end",
-        "calc_start", "calc_end",
-        "F", "G", "H",
-        "paid_workdays", "paid_holidays", "I",
-        "J", "K",
-        "L", "M", "N", "O",
-        "P", "Q",
-    ]
-    df = df[[c for c in col_order if c in df.columns] + [c for c in df.columns if c not in col_order]]
-
-    # Rename for display
-    df = df.rename(columns={
-        "year": "Năm",
-        "month": "Tháng",
-        "month_start": "Ngày 1 của tháng",
-        "month_end": "Ngày cuối tháng",
-        "calc_start": "Bắt đầu tính",
-        "calc_end": "Kết thúc tính",
-        "F": "Ngày làm việc chuẩn (F)",
-        "G": "Ngày nghỉ lễ (G)",
-        "H": "Ngày công trả lương chuẩn (H)",
-        "paid_workdays": "Ngày làm việc thực tế",
-        "paid_holidays": "Ngày lễ thực tế",
-        "I": "Ngày công trả lương thực tế (I)",
-        "J": "Phép năm thực tế (J)",
-        "K": "Lương/ngày (K)",
-        "L": "Chi phí làm việc (L)",
-        "M": "Chi phí nghỉ phép (M)",
-        "N": "Chi phí nghỉ lễ (N)",
-        "O": "Tổng lương phải trả (O)",
-        "P": "BH NSDLĐ (P)",
-        "Q": "TỔNG CHI PHÍ CÔNG TY (Q)",
-    })
+    df = df[["date", "name"]].reset_index(drop=True)
     return df
 
+def default_holidays_for_year(year: int) -> pd.DataFrame:
+    samples = [
+        (date(year, 1, 1), "Tet Duong lich"),
+        (date(year, 4, 30), "Ngay Chien thang"),
+        (date(year, 5, 1), "Quoc te Lao dong"),
+        (date(year, 9, 2), "Quoc khanh"),
+    ]
+    return pd.DataFrame(samples, columns=["date", "name"])
 
-def export_excel(result_df: pd.DataFrame, holidays_df: pd.DataFrame, inputs_dict: dict) -> bytes:
+def calculate_monthly_cost(
+    year: int,
+    gross: float,
+    start_date: date,
+    end_date: date,
+    annual_leave_days: float,
+    holidays_df: pd.DataFrame,
+    employer_ins_enabled: bool,
+    employer_ins_rate: float,
+    employer_ins_cap: float,
+) -> pd.DataFrame:
+    holidays_set = set(holidays_df["date"].dropna().tolist())
+    monthly_leave_accrual = annual_leave_days / 12.0
+    rows = []
+
+    for m in range(1, 13):
+        ms, me = month_start_end(year, m)
+        calc_start = max(start_date, ms)
+        calc_end = min(end_date, me)
+
+        standard_workdays = count_workdays_mon_sat(ms, me, holidays_set)  
+        month_holidays = count_holidays_monsat(ms, me, holidays_set)      
+        standard_paid_days = standard_workdays + month_holidays           
+
+        if calc_start > calc_end:
+            actual_paid_days = 0
+            paid_workdays = 0
+            paid_holidays = 0
+        else:
+            paid_workdays = count_workdays_mon_sat(calc_start, calc_end, holidays_set)
+            paid_holidays = count_holidays_monsat(calc_start, calc_end, holidays_set)
+            actual_paid_days = paid_workdays + paid_holidays              
+
+        if standard_workdays <= 0:
+            ratio = 0.0
+        else:
+            ratio = clamp(actual_paid_days / float(standard_workdays), 0.0, 1.0)
+        leave_days = monthly_leave_accrual * ratio
+
+        daily_rate = (gross / standard_paid_days) if standard_paid_days > 0 else 0.0
+
+        cost_work = max(0.0, paid_workdays - leave_days) * daily_rate     
+        cost_leave = min(leave_days, float(paid_workdays)) * daily_rate   
+        cost_holiday = float(paid_holidays) * daily_rate                  
+        salary_total = float(actual_paid_days) * daily_rate               
+
+        if employer_ins_enabled:
+            base = salary_total
+            if employer_ins_cap and employer_ins_cap > 0:
+                base = min(base, employer_ins_cap)
+            employer_ins = base * employer_ins_rate
+        else:
+            employer_ins = 0.0
+
+        total_company_cost = salary_total + cost_leave + cost_holiday + employer_ins
+
+        rows.append({
+            "Thang": f"{m:02d}",
+            "Ngay 1 cua thang": ms,
+            "Ngay cuoi thang": me,
+            "Bat dau tinh": calc_start,
+            "Ket thuc tinh": calc_end,
+            "Ngay lam viec chuan": standard_workdays,
+            "Ngay nghi le": month_holidays,
+            "Ngay cong chuan": standard_paid_days,
+            "Ngay cong thuc te": actual_paid_days,
+            "Phep nam thuc te": leave_days, 
+            "Luong/ngay": daily_rate,
+            "Chi phi lam viec": cost_work,
+            "Chi phi nghi phep": cost_leave,
+            "Chi phi nghi le": cost_holiday,
+            "Tong luong phai tra": salary_total,
+            "BH NSDLĐ": employer_ins,
+            "TONG CHI PHI CÔNG TY": total_company_cost,
+        })
+
+    return pd.DataFrame(rows)
+
+def export_to_excel(result_df: pd.DataFrame, holidays_df: pd.DataFrame, inputs: dict) -> bytes:
     wb = Workbook()
-    ws = wb.active
-    ws.title = "RESULT"
+    ws1 = wb.active
+    ws1.title = "RESULT"
 
-    ws.append(["INPUTS"])
-    for k, v in inputs_dict.items():
-        ws.append([k, v])
-    ws.append([])
-    ws.append(["MONTHLY_COST"])
+    ws1.append(["INPUTS"])
+    for k, v in inputs.items():
+        ws1.append([k, v])
+    ws1.append([])
+    ws1.append(["MONTHLY_COST"])
 
     for r in dataframe_to_rows(result_df, index=False, header=True):
-        ws.append(r)
+        ws1.append(r)
 
     ws2 = wb.create_sheet("HOLIDAYS")
     ws2.append(["date", "name"])
     for _, row in holidays_df.iterrows():
-        ws2.append([to_date(row["date"]), row.get("name", "")])
+        ws2.append([row["date"], row.get("name", "")])
 
     bio = io.BytesIO()
     wb.save(bio)
     return bio.getvalue()
 
-
-# ----------------------------
-# UI
-# ----------------------------
-st.set_page_config(page_title="HR Cost (Mon–Sat)", layout="wide")
-st.title("HR Cost Webapp (Mon–Sat) — khớp logic Excel")
+st.set_page_config(page_title="Mo hinh nhan su", layout="wide")
+st.title("Mo hinh chi phi nhan su theo thang")
 
 with st.sidebar:
-    st.header("Inputs")
-
-    gross = st.number_input("Gross/tháng (VND)", min_value=0.0, value=20_000_000.0, step=500_000.0)
-    start_dt = st.date_input("Ngày bắt đầu", value=date(2026, 4, 15))
-    end_dt = st.date_input("Ngày kết thúc", value=date(start_dt.year, 12, 31))
-    year = st.number_input("Năm tính (YYYY)", min_value=2000, max_value=2100, value=int(start_dt.year), step=1)
-    annual_leave_days = st.number_input("Phép năm (ngày/năm)", min_value=0.0, value=12.0, step=1.0)
-
-    st.divider()
-    st.subheader("BH NSDLĐ")
-    ins_enabled = st.checkbox("Bật tính BH NSDLĐ", value=True)
-    ins_rate = st.number_input("Tỷ lệ BH", min_value=0.0, max_value=1.0, value=0.215, step=0.001, format="%.3f")
-    ins_cap = st.number_input("Trần BH (0 = không trần)", min_value=0.0, value=5_500_000.0, step=100_000.0)
+    st.header("Thong tin dau vao")
+    gross = st.number_input("Luong gross / thang", min_value=0.0, value=20_000_000.0, step=500_000.0)
+    start_dt = st.date_input("Ngay bat dau", value=date(2026, 4, 15))
+    default_end = date(start_dt.year, 12, 31)
+    end_dt = st.date_input("Ngay ket thuc", value=default_end)
+    year = st.number_input("Nam can tinh", min_value=2000, max_value=2100, value=int(start_dt.year), step=1)
+    annual_leave_days = st.number_input("So ngay phep nam", min_value=0.0, value=12.0, step=1.0)
 
     st.divider()
-    st.subheader("Holidays")
-    upload = st.file_uploader("Upload holidays (CSV/XLSX)", type=["csv", "xlsx", "xls"])
+    employer_ins_enabled = st.checkbox("Tinh Bao Hiem", value=True)
+    employer_ins_rate = st.number_input("Ty le Bao Hiem", min_value=0.0, max_value=1.0, value=0.215, step=0.001, format="%.3f")
+    employer_ins_cap = st.number_input("Tran luong dong BH", min_value=0.0, value=5_500_000.0, step=100_000.0)
 
+    st.divider()
+    st.subheader("Ngay Le")
+    upload = st.file_uploader("Tai tep ngay le len", type=["csv", "xlsx", "xls"])
+    use_default = st.checkbox("Dung danh sach mau", value=True)
 
-if start_dt > end_dt:
-    st.error("Ngày bắt đầu đang lớn hơn ngày kết thúc.")
-    st.stop()
-
-# Holidays input table
 try:
-    holidays_df = read_holidays_upload(upload)
+    holidays_df = parse_holidays_upload(upload)
 except Exception as e:
-    st.error(f"Lỗi đọc holidays: {e}")
+    st.error(f"Loi: {e}")
     holidays_df = pd.DataFrame(columns=["date", "name"])
 
-# If empty -> start with blank rows (user tự thêm)
+if holidays_df.empty and use_default:
+    holidays_df = default_holidays_for_year(int(year))
+
 holidays_df = holidays_df.copy()
-if holidays_df.empty:
-    holidays_df = pd.DataFrame([{"date": None, "name": ""}], columns=["date", "name"])
+holidays_df["date"] = holidays_df["date"].apply(to_date)
+holidays_df = holidays_df.dropna(subset=["date"])
+holidays_df = holidays_df[holidays_df["date"].apply(lambda d: d.year == int(year))].reset_index(drop=True)
 
-st.caption("Bạn có thể chỉnh trực tiếp danh sách ngày lễ (thêm/xoá/sửa).")
-edited_holidays = st.data_editor(
-    holidays_df,
-    num_rows="dynamic",
-    use_container_width=True,
-    column_config={
-        "date": st.column_config.DateColumn("date", format="DD/MM/YYYY"),
-        "name": st.column_config.TextColumn("name"),
-    },
-)
+colA, colB = st.columns([2, 1])
+with colA:
+    edited_holidays = st.data_editor(
+        holidays_df,
+        num_rows="dynamic",
+        use_container_width=True,
+        column_config={
+            "date": st.column_config.DateColumn("date", format="DD/MM/YYYY"),
+            "name": st.column_config.TextColumn("name"),
+        }
+    )
 
-# Build engine inputs
-inputs = Inputs(
-    gross_monthly=float(gross),
+if start_dt > end_dt:
+    st.error("Ngay bat dau lon hon ngay ket thuc.")
+    st.stop()
+
+result_df = calculate_monthly_cost(
+    year=int(year),
+    gross=float(gross),
     start_date=start_dt,
     end_date=end_dt,
     annual_leave_days=float(annual_leave_days),
-    employer_insurance=EmployerInsurance(
-        enabled=bool(ins_enabled),
-        rate=float(ins_rate),
-        cap=float(ins_cap),
-    ),
+    holidays_df=edited_holidays,
+    employer_ins_enabled=bool(employer_ins_enabled),
+    employer_ins_rate=float(employer_ins_rate),
+    employer_ins_cap=float(employer_ins_cap),
 )
 
-holidays = df_to_holidays(edited_holidays)
-
-engine = CalculationEngine(inputs, holidays)
-rows = engine.calculate_year(int(year))
-result_df = result_rows_to_df(rows)
-
-# Display
-st.subheader("Kết quả theo tháng")
+st.subheader("Bang Ket Qua Chi Phi")
 st.dataframe(result_df, use_container_width=True)
 
-# KPI
-total_O = float(pd.to_numeric(result_df["Tổng lương phải trả (O)"]).sum())
-total_P = float(pd.to_numeric(result_df["BH NSDLĐ (P)"]).sum())
-total_Q = float(pd.to_numeric(result_df["TỔNG CHI PHÍ CÔNG TY (Q)"]).sum())
+total_salary = float(result_df["Tong luong phai tra"].sum())
+total_ins = float(result_df["BH NSDLĐ"].sum())
+total_company = float(result_df["TONG CHI PHI CÔNG TY"].sum())
 
-c1, c2, c3 = st.columns(3)
-c1.metric("Tổng lương (O)", f"{total_O:,.0f} VND")
-c2.metric("Tổng BH (P)", f"{total_P:,.0f} VND")
-c3.metric("Tổng chi phí (Q)", f"{total_Q:,.0f} VND")
+k1, k2, k3 = st.columns(3)
+k1.metric("Tong luong phai tra", f"{total_salary:,.0f} VND")
+k2.metric("Tong Bao Hiem", f"{total_ins:,.0f} VND")
+k3.metric("Tong chi phi cong ty", f"{total_company:,.0f} VND")
 
-# Export
-inputs_dict = {
-    "gross_monthly": gross,
+inputs = {
+    "gross": gross,
     "start_date": start_dt.strftime("%d/%m/%Y"),
     "end_date": end_dt.strftime("%d/%m/%Y"),
     "year": int(year),
     "annual_leave_days": annual_leave_days,
-    "insurance_enabled": ins_enabled,
-    "insurance_rate": ins_rate,
-    "insurance_cap": ins_cap,
+    "employer_ins_enabled": employer_ins_enabled,
+    "employer_ins_rate": employer_ins_rate,
+    "employer_ins_cap": employer_ins_cap,
 }
-xlsx = export_excel(result_df, edited_holidays, inputs_dict)
+xlsx_bytes = export_to_excel(result_df, edited_holidays, inputs)
 
 st.download_button(
-    "Download Excel kết quả",
-    data=xlsx,
-    file_name=f"hr_cost_{year}.xlsx",
+    "Tai xuong bang Excel",
+    data=xlsx_bytes,
+    file_name=f"Chi_phi_nhan_su_{year}.xlsx",
     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
 )
